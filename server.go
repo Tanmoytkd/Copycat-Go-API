@@ -1,9 +1,7 @@
 package main
 
 import (
-	"crypto/rand"
 	"database/sql"
-	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -13,60 +11,8 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
-	"sync"
+	"time"
 )
-
-// We need a data store. For our purposes, a simple map
-// from string to string is completely sufficient.
-type store struct {
-	data map[string]string
-
-	// Handlers run concurrently, and maps are not thread-safe.
-	// This mutex is used to ensure that only one goroutine can update `data`.
-	m sync.RWMutex
-}
-
-// GenerateRandomBytes returns securely generated random bytes.
-// It will return an error if the system's secure random
-// number generator fails to function correctly, in which
-// case the caller should not continue.
-func GenerateRandomBytes(n int) ([]byte, error) {
-	b := make([]byte, n)
-	_, err := rand.Read(b)
-	// Note that err == nil only if we read len(b) bytes.
-	if err != nil {
-		return nil, err
-	}
-
-	return b, nil
-}
-
-// GenerateRandomString returns a securely generated random string.
-// It will return an error if the system's secure random
-// number generator fails to function correctly, in which
-// case the caller should not continue.
-func GenerateRandomString(n int) (string, error) {
-	const letters = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-"
-	bytes, err := GenerateRandomBytes(n)
-	if err != nil {
-		return "", err
-	}
-	for i, b := range bytes {
-		bytes[i] = letters[b%byte(len(letters))]
-	}
-	return string(bytes), nil
-}
-
-// GenerateRandomStringURLSafe returns a URL-safe, base64 encoded
-// securely generated random string.
-// It will return an error if the system's secure random
-// number generator fails to function correctly, in which
-// case the caller should not continue.
-func GenerateRandomStringURLSafe(n int) (string, error) {
-	b, err := GenerateRandomBytes(n)
-	return base64.URLEncoding.EncodeToString(b), err
-}
-
 
 var (
 	// We need a flag for setting the listening address.
@@ -75,17 +21,7 @@ var (
 	addr = flag.String("addr", ":8080", "http service address")
 
 	db *sql.DB
-
-	// Now we create the data store.
-	s = store{
-		data: map[string]string{},
-		m:    sync.RWMutex{},
-	}
 )
-
-type tok struct {
-	Token string
-}
 
 //this function checks for error and throws a runtime
 //error if an error is found
@@ -95,26 +31,14 @@ func checkError(err error) {
 	}
 }
 
-func connectDatabase() *sql.DB {
-	const (
-		host     = "localhost"
-		database = "copycat"
-		user     = "tanmoy"
-		password = "jwjHr4RqGq0MOxpu@"
-	)
 
-	// Initialize connection string.
-	var connectionString = fmt.Sprintf("%s:%s@tcp(%s:3306)/%s?allowNativePasswords=true", user, password, host, database)
-
-	db, dbErr := sql.Open("mysql", connectionString);
-	checkError(dbErr)
-	err001 := db.Ping()
-	checkError(err001)
-	return db;
-}
 
 // ## main
 func main() {
+	var currentTime time.Time = time.Now()
+	fmt.Println(currentTime)
+
+
 	// The main function starts by parsing the commandline.
 	flag.Parse()
 
@@ -127,6 +51,8 @@ func main() {
 	r.HandleFunc("/register", register).Methods("POST")
 	r.HandleFunc("/login", login).Methods("POST")
 	r.HandleFunc("/logout", logout).Methods("POST")
+
+	r.HandleFunc("/sessions/create", createSession).Methods("POST")
 
 	r.HandleFunc("/", func(writer http.ResponseWriter, request *http.Request) {
 		writer.WriteHeader(http.StatusOK)
@@ -144,6 +70,16 @@ func main() {
 	if err != nil {
 		log.Fatal("ListenAndServe:", err)
 	}
+}
+
+func isValidToken(token string) bool  {
+	accountChecker, err := db.Prepare("SELECT EXISTS (SELECT `id` FROM `accounts` WHERE `token`=?)");
+	checkError(err)
+
+	alreadyRegistered := false
+	err = accountChecker.QueryRow(token).Scan(&alreadyRegistered)
+	checkError(err)
+	return alreadyRegistered
 }
 
 func renewToken(oldToken string) string {
@@ -247,6 +183,19 @@ func login(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 
+	passChecker, err := db.Prepare("SELECT EXISTS (SELECT `id` FROM `accounts` WHERE `email`=? AND `password`=?)");
+	checkError(err)
+
+	passwordCorrect := false
+	err = passChecker.QueryRow(account.Email, account.Password).Scan(&passwordCorrect)
+	checkError(err)
+
+	if !passwordCorrect {
+		writer.WriteHeader(http.StatusUnauthorized)
+		fmt.Fprintln(writer, "Email or Password incorrect.")
+		return
+	}
+
 	var id int
 
 	stmt, err := db.Prepare("SELECT `id` FROM `accounts` WHERE `email`=? AND `password`=?")
@@ -263,6 +212,43 @@ func login(writer http.ResponseWriter, request *http.Request) {
 	writer.WriteHeader(http.StatusOK)
 	fmt.Fprintln(writer, "{\"token\":\""+token+"\"}")
 }
+
+func createSession(writer http.ResponseWriter, request *http.Request) {
+	type SessionInfo struct {
+		Token string
+		Name string
+		Code string
+		Password string
+		Data string
+	}
+
+	data, _ := ioutil.ReadAll(request.Body)
+
+	fmt.Println("input data: ", string(data))
+
+	var account SessionInfo
+	json.Unmarshal(data, &account)
+
+	if !isValidToken(account.Token) {
+		writer.WriteHeader(http.StatusForbidden)
+		fmt.Fprintln(writer, "Please login to create Sessions.")
+		return
+	}
+
+	account.Password = xhashes.SHA256(account.Password)
+	hash := xhashes.SHA256(account.Code+"$"+account.Password)
+
+
+	_, err := db.Exec("INSERT INTO `collab_sessions`(`name`, `code`, `password`, `data`, `hash`) VALUES (?, ?, ?, ?, ?)",
+		account.Name, account.Code, account.Password, account.Data, hash)
+	checkError(err)
+
+	writer.WriteHeader(http.StatusOK)
+	fmt.Fprintln(writer, "{\"message\": \"Session \""+account.Name+"\" created successfully\", " +
+		"\"hash\":\""+hash+"\"")
+}
+
+
 
 /*
 After saving, we can run the code locally by calling
